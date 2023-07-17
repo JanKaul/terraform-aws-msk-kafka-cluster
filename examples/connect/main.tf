@@ -48,7 +48,7 @@ module "msk_cluster" {
       s3_object_version = aws_s3_object.debezium_connector.version_id
 
       timeouts = {
-        create = "20m"
+        create = "5m"
       }
     }
   }
@@ -101,6 +101,8 @@ module "security_group" {
     "kafka-broker-tcp",
     "kafka-broker-tls-tcp"
   ]
+  
+  egress_rules = ["all-all"]
 
   tags = local.tags
 }
@@ -111,6 +113,9 @@ module "s3_bucket" {
 
   bucket_prefix = local.name
   acl           = "private"
+  
+  control_object_ownership = true
+  object_ownership         = "ObjectWriter"
 
   versioning = {
     enabled = true
@@ -149,4 +154,106 @@ resource "null_resource" "debezium_connector" {
         && rm *.tar.gz
     EOT
   }
+}
+
+################################################################################
+# IAM Role
+################################################################################
+
+module "iam_policy_kafka" {
+  source = "terraform-aws-modules/iam/aws//modules/iam-policy"
+
+  name        = "${local.name}_kafka"
+  path        = "/"
+  description = "My example policy"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "kafka-cluster:*Topic*",
+          "kafka-cluster:WriteData",
+          "kafka-cluster:ReadData"
+        ]
+        Resource = module.msk_cluster.arn
+      }
+    ]
+  })
+}
+
+module "iam_assumable_role" {
+  source = "terraform-aws-modules/iam/aws//modules/iam-assumable-role"
+
+  trusted_role_services = ["kafkaconnect.amazonaws.com"]
+
+  create_role = true
+
+  role_name         = local.name
+  role_requires_mfa = false
+
+  custom_role_policy_arns = [
+    module.iam_policy_kafka.arn,
+  ]
+  number_of_custom_role_policy_arns = 1
+}
+
+################################################################################
+# Connector
+################################################################################
+
+resource "aws_mskconnect_connector" "debezium_postgres" {
+  name = local.name
+
+  kafkaconnect_version = "2.7.1"
+
+  capacity {
+    provisioned_capacity {
+      worker_count = 1
+    }
+  }
+
+  connector_configuration = {
+    "name"                                            = local.name
+    "connector.class"                                 = "io.debezium.connector.postgresql.PostgresConnector"
+    "tasks.max"                                       = 1
+  }
+
+  kafka_cluster {
+    apache_kafka_cluster {
+      bootstrap_servers = module.msk_cluster.bootstrap_brokers_tls
+
+      vpc {
+        security_groups = [module.security_group.security_group_id]
+        subnets         = module.vpc.private_subnets
+      }
+    }
+  }
+
+  kafka_cluster_client_authentication {
+    authentication_type = "NONE"
+  }
+
+  kafka_cluster_encryption_in_transit {
+    encryption_type = "TLS"
+  }
+
+  plugin {
+    custom_plugin {
+      arn      = module.msk_cluster.connect_custom_plugins.debezium.arn
+      revision = module.msk_cluster.connect_custom_plugins.debezium.latest_revision
+    }
+  }
+
+  log_delivery {
+    worker_log_delivery {
+      s3 {
+        enabled = true
+        bucket  = module.s3_bucket.s3_bucket_id
+      }
+    }
+  }
+
+  service_execution_role_arn = module.iam_assumable_role.iam_role_arn
 }
